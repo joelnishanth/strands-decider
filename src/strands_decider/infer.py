@@ -16,6 +16,8 @@ decomposable in the way the API promises.
 Set `use_prefix_cache=False` to fall back to plain batched encoding. The two paths
 agree to within float tolerance (tests/test_prefix_cache.py pins that, for plain and hybrid torsos), so the
 fallback is a safety valve rather than a different model.
+
+Steps 1-3 run behind a `TorsoBackend` (`TorchBackend` by default); the readout stays in the engine.
 """
 
 from __future__ import annotations
@@ -23,11 +25,11 @@ from __future__ import annotations
 import copy
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 
-from .modeling import StrandsDeciderModel, apply_temperature, masked_log_softmax, pool_last_token
+from .modeling import StrandsDeciderModel, apply_temperature, gather_options, masked_log_softmax
 from .prompting import (
     RenderedQuestion,
     read_choice,
@@ -124,19 +126,139 @@ def _expand_cache(cache: Any, n: int) -> Any:
     raise UnforkableCache(f"unsupported KV cache type: {type(cache)!r}")
 
 
+class TorsoBackend(Protocol):
+    """Runs the torso: token ids in, final-layer hidden states out.
+
+    The engine keeps everything else (tokenising, option positions, the head,
+    temperature, softmax), so a backend never sees text and every backend is read out
+    by the same fp32 head.
+    """
+
+    name: str  # "torch" | "mlx", reported by /health
+
+    @property
+    def hidden_size(self) -> int: ...
+
+    def hidden_states(
+        self,
+        prefix: list[int],
+        suffixes: list[list[int]],
+        positions: list[list[int]],
+        *,
+        share_prefix: bool,
+    ) -> torch.Tensor:
+        """float32 [M, P, d]: row i, column j is the hidden state of prompt
+        `prefix + suffixes[i]` at suffix-relative position `positions[i][j]`, after the
+        final norm, with the LoRA adapter applied.
+
+        `share_prefix=True` encodes the prefix once and forks its cache across the M
+        rows; a backend that cannot fork raises UnforkableCache, and the engine falls
+        back to `share_prefix=False`, which encodes each full prompt independently.
+        """
+        ...
+
+
+class TorchBackend:
+    """The torso in torch: the default backend, and the reference the others match.
+
+    Holds the model rather than its torso and reads `model.torso` on every call, so an
+    in-place cast of the torso (evaluation/bench_local.py) still takes effect.
+    """
+
+    name = "torch"
+
+    def __init__(self, model: StrandsDeciderModel, device: str):
+        self.model = model
+        self.device = device
+
+    @property
+    def hidden_size(self) -> int:
+        return StrandsDeciderModel.hidden_size(self.model.torso)
+
+    def _pad(self, seqs: list[list[int]]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Right-pad to a rectangle, with the mask marking the real tokens."""
+        tok = self.model.tokenizer
+        pad_id = tok.pad_token_id if tok.pad_token_id is not None else 0
+        width = max(len(x) for x in seqs)
+        ids = torch.tensor(
+            [x + [pad_id] * (width - len(x)) for x in seqs], device=self.device
+        )
+        mask = torch.tensor(
+            [[1] * len(x) + [0] * (width - len(x)) for x in seqs], device=self.device
+        )
+        return ids, mask
+
+    @torch.inference_mode()  # type: ignore[untyped-decorator, unused-ignore]
+    def hidden_states(
+        self,
+        prefix: list[int],
+        suffixes: list[list[int]],
+        positions: list[list[int]],
+        *,
+        share_prefix: bool,
+    ) -> torch.Tensor:
+        pos = torch.tensor(positions, dtype=torch.long, device=self.device)
+        if not share_prefix:
+            ids, mask = self._pad([prefix + s for s in suffixes])
+            hidden = self.model.encode(ids, mask)
+            # The whole prompt was forwarded, so the positions sit after the state.
+            return gather_options(hidden, pos + len(prefix)).to(torch.float32)
+
+        m = len(suffixes)
+        prefix_ids = torch.tensor([prefix], device=self.device)
+        prefix_len = prefix_ids.size(1)
+
+        prefix_out = self.model.torso(
+            input_ids=prefix_ids,
+            attention_mask=torch.ones_like(prefix_ids),
+            use_cache=True,
+            return_dict=True,
+        )
+        cache = _expand_cache(prefix_out.past_key_values, m)
+
+        suffix_ids, suffix_mask = self._pad(suffixes)
+        full_mask = torch.cat(
+            [
+                torch.ones(m, prefix_len, dtype=suffix_mask.dtype, device=self.device),
+                suffix_mask,
+            ],
+            dim=1,
+        )
+
+        hidden = self.model.encode(
+            input_ids=suffix_ids,
+            attention_mask=full_mask,
+            past_key_values=cache,
+        )
+        # `hidden` is the suffix only, so the positions need no prefix offset -- the
+        # cached state never enters the gather.
+        return gather_options(hidden, pos).to(torch.float32)
+
+
 class SystemOneEngine:
     """Stateless evaluator around a loaded StrandsDeciderModel."""
 
-    def __init__(self, model: StrandsDeciderModel, config: EngineConfig | None = None):
+    def __init__(
+        self,
+        model: StrandsDeciderModel,
+        config: EngineConfig | None = None,
+        backend: TorsoBackend | None = None,
+    ):
         self.cfg = config or EngineConfig()
-        if str(self.cfg.device).startswith("mps"):
-            # No fla/Triton on macOS; replace the reference chunk rule's slow MPS solver.
-            from .mps_kernels import install
+        if backend is None:
+            if str(self.cfg.device).startswith("mps"):
+                # No fla/Triton on macOS; replace the reference chunk rule's slow MPS solver.
+                from .mps_kernels import install
 
-            install()
-        self.model = model.to(self.cfg.device).eval()
-        if str(self.cfg.device) == "cpu":
-            self._upcast_torso_for_cpu()
+                install()
+            self.model = model.to(self.cfg.device).eval()
+            if str(self.cfg.device) == "cpu":
+                self._upcast_torso_for_cpu()
+            self.backend: TorsoBackend = TorchBackend(self.model, self.cfg.device)
+        else:
+            # The backend owns the torso; only the readout runs here, on cfg.device.
+            self.model = model.to(self.cfg.device).eval()
+            self.backend = backend
         self.tok = model.tokenizer
         self.device = self.cfg.device
 
@@ -213,122 +335,63 @@ class SystemOneEngine:
         )["input_ids"]
         return s, q
 
-    def _option_idx(self, rendered: list[RenderedQuestion], base: int) -> torch.Tensor:
-        """Option token positions for a pointer head, offset by `base`.
+    def _positions(
+        self, rendered: list[RenderedQuestion], q: list[list[int]]
+    ) -> list[list[int]]:
+        """Suffix-relative positions to read from each question's hidden states.
 
-        `base` is 0 when the caller forwards only the question (the shared-prefix path,
-        where `hidden` is the suffix) and the state's token count when it forwards the
-        whole prompt. Uses the offsets `_fit` kept, so front truncation is accounted for.
+        Column 0 is the pooling position: the last question token, `<answer>`, the
+        position that has attended to state and question alike. For a pointer head,
+        columns 1.. are the option positions, from the offsets `_fit` kept so front
+        truncation is accounted for. Short rows are padded with 0; `masked_log_softmax`
+        drops every option past the row's count.
         """
+        pool = [[len(x) - 1] for x in q]
+        if self.model.config.head_type != "pointer":
+            return pool
         rows = [
             _option_token_index(offs, rq.option_spans, 0)
             for rq, offs in zip(rendered, self._last_offsets, strict=True)
         ]
         width = max(len(r) for r in rows)
-        return torch.tensor(
-            [[base + i for i in r] + [-1] * (width - len(r)) for r in rows],
-            dtype=torch.long,
-            device=self.device,
-        )
-
-    def _pad(self, seqs: list[list[int]]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Right-pad to a rectangle; pool_last_token finds the last real token by mask."""
-        pad_id = self.tok.pad_token_id if self.tok.pad_token_id is not None else 0
-        width = max(len(x) for x in seqs)
-        ids = torch.tensor(
-            [x + [pad_id] * (width - len(x)) for x in seqs], device=self.device
-        )
-        mask = torch.tensor(
-            [[1] * len(x) + [0] * (width - len(x)) for x in seqs], device=self.device
-        )
-        return ids, mask
+        return [p + r + [0] * (width - len(r)) for p, r in zip(pool, rows, strict=True)]
 
     # ---- low level -------------------------------------------------------
 
-    @torch.inference_mode()  # type: ignore[untyped-decorator]
-    def _slot_probs_batched(
-        self, state_text: str, question_texts: list[str],
-        n_slots: list[int], kinds: list[str],
-        rendered: list[RenderedQuestion] | None = None,
-    ) -> tuple[torch.Tensor, int]:
-        """Fallback: encode each full prompt independently.
-
-        Previously this concatenated state and question into one string and let the
-        tokeniser truncate, which cuts from the right -- removing the options and the
-        `<answer>` marker the head pools at. Now it shares `_fit` with the cached path,
-        so both truncate the same thing in the same direction.
-        """
-        s, q = self._fit(state_text, question_texts)
-        ids, mask = self._pad([s + qi for qi in q])
-        # This path forwards the whole prompt, so option positions sit after the state.
-        assert rendered is not None or self.model.config.head_type != "pointer"
-        opt_idx = (self._option_idx(rendered, len(s))  # type: ignore[arg-type]
-                   if self.model.config.head_type == "pointer" else None)
-        out = self.model(
-            input_ids=ids,
-            attention_mask=mask,
-            n_slots=torch.tensor(n_slots, device=self.device),
-            temperature=self._temperatures(kinds),
-            opt_idx=opt_idx,
-        )
-        return out["log_probs"].exp(), int(mask.sum().item())
-
-    @torch.inference_mode()  # type: ignore[untyped-decorator]
-    def _slot_probs_shared_prefix(
+    @torch.inference_mode()  # type: ignore[untyped-decorator, unused-ignore]
+    def _slot_probs(
         self,
         state_text: str,
         question_texts: list[str],
         n_slots: list[int],
         kinds: list[str],
-        rendered: list[RenderedQuestion] | None = None,
+        rendered: list[RenderedQuestion],
+        *,
+        share_prefix: bool,
     ) -> tuple[torch.Tensor, int]:
-        """Encode the state once, then all question suffixes against that cache."""
-        m = len(question_texts)
+        """Option probabilities per question, and the input tokens the torso forwarded.
+
+        `share_prefix=True` encodes the state once and every question suffix against
+        that cache; False encodes each full prompt independently. Both go through
+        `_fit`, so they truncate the same thing in the same direction.
+        """
         # The suffixes continue an already-tokenised sequence, so _fit adds no BOS to
         # them -- one mid-sequence would be a token training never saw.
         s, q = self._fit(state_text, question_texts)
-        prefix_ids = torch.tensor([s], device=self.device)
-        prefix_len = prefix_ids.size(1)
-
-        prefix_out = self.model.torso(
-            input_ids=prefix_ids,
-            attention_mask=torch.ones_like(prefix_ids),
-            use_cache=True,
-            return_dict=True,
-        )
-        cache = _expand_cache(prefix_out.past_key_values, m)
-
-        suffix_ids, suffix_mask = self._pad(q)
-        full_mask = torch.cat(
-            [
-                torch.ones(m, prefix_len, dtype=suffix_mask.dtype, device=self.device),
-                suffix_mask,
-            ],
-            dim=1,
-        )
-
-        hidden = self.model.encode(
-            input_ids=suffix_ids,
-            attention_mask=full_mask,
-            past_key_values=cache,
-        )
-        # pool_last_token slices the mask to the forwarded tail, so it lands on the
-        # last real *suffix* token -- which is `<answer>`, the position that has
-        # attended to state and question alike.
-        pooled = pool_last_token(hidden, full_mask).to(torch.float32)
+        positions = self._positions(rendered, q)
+        h = self.backend.hidden_states(s, q, positions, share_prefix=share_prefix)
+        h = h.to(self.device)
+        pooled = h[:, 0]
         if self.model.config.head_type == "pointer":
-            # `hidden` is the suffix only, so option positions are suffix-relative and
-            # need no prefix offset -- the cached state never enters the gather.
-            from .modeling import gather_options
-
-            assert rendered is not None
-            options = gather_options(hidden, self._option_idx(rendered, 0))
-            raw = self.model.head(pooled, options.to(torch.float32))
+            raw = self.model.head(pooled, h[:, 1:])
         else:
             raw = self.model.head(pooled)
         logits = apply_temperature(raw, self._temperatures(kinds))
         log_probs = masked_log_softmax(logits, torch.tensor(n_slots, device=self.device))
-        n_tokens = prefix_len + int(suffix_mask.sum().item())
+        if share_prefix:
+            n_tokens = len(s) + sum(len(x) for x in q)
+        else:
+            n_tokens = sum(len(s) + len(x) for x in q)
         return log_probs.exp(), n_tokens
 
     # ---- public ----------------------------------------------------------
@@ -371,18 +434,18 @@ class SystemOneEngine:
             # through the prefix path, with the same answers.
             if self.cfg.use_prefix_cache and len(chunk_rendered) > 1:
                 try:
-                    probs, ntok = self._slot_probs_shared_prefix(
+                    probs, ntok = self._slot_probs(
                         state_text, [rq.text for rq in chunk_rendered], chunk_slots,
-                        chunk_kinds, rendered=chunk_rendered,
+                        chunk_kinds, chunk_rendered, share_prefix=True,
                     )
                     total_tokens += ntok
                 except UnforkableCache as e:
                     print(f"[strands-decider] shared-prefix cache disabled ({e}); using batched encoding")
                     self.cfg = replace(self.cfg, use_prefix_cache=False)
             if probs is None:
-                probs, ntok = self._slot_probs_batched(
+                probs, ntok = self._slot_probs(
                     state_text, [rq.text for rq in chunk_rendered], chunk_slots,
-                    chunk_kinds, rendered=chunk_rendered,
+                    chunk_kinds, chunk_rendered, share_prefix=False,
                 )
                 total_tokens += ntok
 
