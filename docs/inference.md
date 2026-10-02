@@ -292,35 +292,37 @@ curl -s localhost:11434/api/chat -H 'content-type: application/json' -d '{
 }'
 ```
 
-An illustrative reply follows. It shows the shape, not recorded output: the numbers are
-made up.
+The reply below was recorded from
+`strands-decider serve StrandsAgents/strands-decider-2B-hobson-v19 --device mps --port 11434`
+on an Apple M4 Pro, with whitespace added. It was the first request after startup, so its
+9.7 s includes MPS warm-up; the same request again took 0.39 s with identical answers.
 
 ```json
 {
-  "model": "hobson-2b-recipe",
-  "created_at": "2025-01-01T12:00:00.123456Z",
+  "model": "strands-decider-2B-hobson-v19",
+  "created_at": "2026-10-02T18:29:05.867600Z",
   "message": {"role": "assistant",
               "content": "{\"is_urgent\": true, \"department\": \"technical\", \"frustration\": \"frustrated\"}"},
   "done": true,
   "done_reason": "stop",
-  "total_duration": 152000000,
+  "total_duration": 9667884875,
   "load_duration": 0,
-  "prompt_eval_count": 120,
-  "prompt_eval_duration": 150000000,
+  "prompt_eval_count": 203,
+  "prompt_eval_duration": 9667475125,
   "eval_count": 3,
   "eval_duration": 0,
   "strands_decider": {
     "answers": {
-      "is_urgent": {"type": "noul", "noul": 0.80},
+      "is_urgent": {"type": "noul", "noul": 0.807},
       "department": {"type": "choice", "choice": "technical",
-                     "probabilities": {"billing": 0.23, "technical": 0.75, "sales": 0.02},
-                     "confidence": 0.62},
-      "frustration": {"type": "score", "score": 1.24,
+                     "probabilities": {"billing": 0.4037, "technical": 0.5813, "sales": 0.015},
+                     "confidence": 0.3719},
+      "frustration": {"type": "score", "score": 1.2015,
                       "legend": {"0": "calm", "1": "frustrated", "2": "very angry"},
-                      "probabilities": {"0": 0.09, "1": 0.58, "2": 0.33}, "confidence": 0.58}
+                      "probabilities": {"0": 0.149, "1": 0.5006, "2": 0.3505}, "confidence": 0.4718}
     },
-    "usage": {"input_tokens": 120, "output_tokens": 3},
-    "latency_ms": 150.0
+    "usage": {"input_tokens": 203, "output_tokens": 3},
+    "latency_ms": 9667.48
   }
 }
 ```
