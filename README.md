@@ -160,6 +160,12 @@ curl -s localhost:8000/v1/systemone \
   ```
 </details>
 
+The same server also speaks Ollama's `/api/chat` and `/api/generate`, when the request's
+`format` carries a JSON schema of questions: booleans, enums and scored enums. Start it with
+`--port 11434` to repoint an existing Ollama client. Like `/v1/systemone`, these routes bind
+to `127.0.0.1` and have no authentication. See
+[docs/inference.md](docs/inference.md#ollama-compatible-api).
+
 ## About the model
 
 `strands-decider-2B`, the first model of the family, has 1.9 billion parameters. It answers a

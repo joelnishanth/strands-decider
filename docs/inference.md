@@ -13,6 +13,7 @@ checkpoint with `strands-decider calibrate` before you serve it.
 - [Model artifact](#model-artifact): what a checkpoint holds, and the Hugging Face export.
 - [Ask](#ask): one command, with recorded v19 output and how to read its confidence.
 - [Serve](#serve): `POST /v1/systemone` and `/health`, on `127.0.0.1` with no authentication.
+- [Ollama-compatible API](#ollama-compatible-api): `/api/chat` and `/api/generate` for clients that already talk to Ollama.
 - [Asking many questions is nearly free](#asking-many-questions-is-nearly-free): the shared-prefix cache.
 - [Serving on a Mac](#serving-on-a-mac): MPS, and the one kernel that had to be replaced.
 - [`../examples/strands/`](../examples/strands/README.md): an agent built with the Strands
@@ -188,6 +189,183 @@ cut, and the question keeps its options. `--strict-window` refuses such a prompt
 with HTTP 422 and a message that names the context window, for an evaluation that forbids
 truncation. `--max-batch N` (default 32) sets how many questions one forward pass encodes;
 lower it when a very long state with many questions does not fit in GPU memory.
+
+## Ollama-compatible API
+
+The same server also answers a subset of the [Ollama API](https://github.com/ollama/ollama/blob/main/docs/api.md):
+`POST /api/chat`, `POST /api/generate`, `GET /api/tags`, `POST /api/show` and
+`GET /api/version`. It is a translation onto the same engine as `/v1/systemone`, not a
+language model: the decider generates no text. A request must carry a JSON schema in
+Ollama's `format` field. Each top-level property of that schema becomes one typed
+question, and the reply's content is a JSON string that matches the schema.
+
+Ollama clients default to `http://127.0.0.1:11434`, so serve on that port to repoint one
+without changing it:
+
+```bash
+strands-decider serve checkpoints/hobson-2b-recipe --port 11434
+```
+
+That port clashes with a running Ollama. To keep both, serve on another port and point
+the client at it, with `OLLAMA_HOST=127.0.0.1:8000` or `ollama.Client(host="http://127.0.0.1:8000")`.
+The `model` field of a request is accepted and not checked, so a client hard-coded to a
+name such as `llama3` still works. Replies always report the served model name.
+
+### From schema to questions
+
+| Property in `format` | Question |
+| --- | --- |
+| `{"type": "boolean"}` | `noul` |
+| `{"enum": [...]}` | `choice`; the enum values are the option names |
+| `{"enum": [...], "x-strands-decider": {"type": "score"}}` | `score`; the enum is read in ascending order, the first value is the low end |
+
+The question's instructions are the property's `description`, else its `title`, else the
+property name. The optional `x-strands-decider` object takes two keys, `type` (`noul`,
+`choice` or `score`) and `criteria`. Any other key is refused, to catch typos.
+
+- On a boolean, `criteria` is `{"true": "...", "false": "..."}`, as in a `noul` question.
+- On a choice, `criteria` maps option names to descriptions (a string or `null`). An
+  option without an entry is a bare label.
+- On a score, `criteria` is a list of level texts, one per enum value, low to high. It
+  lets a numeric enum such as `[1, 2, 3, 4, 5]` carry a rubric. Without it the level texts
+  are the enum values.
+
+Enum values must be strings or numbers, distinct as text. A choice takes 2 to 255
+options and a score 2 to 10 levels. A local `$ref` into the schema's `$defs` or
+`definitions` is resolved, which covers the schema `Model.model_json_schema()` emits for a
+Pydantic model with a Python `Enum` field. Every property is answered: `required`,
+`additionalProperties` and `title` at the top level are ignored. Anything else, such as a
+string with no enum, a number, an array, an object, `anyOf` or `const`, is refused with a
+400 that names the property.
+
+### From conversation to state
+
+On `/api/chat`, the messages become the `state` in request order, system messages
+included. Messages whose content is blank are dropped. A single remaining message is the
+state verbatim, so a one-message chat sends the model exactly what `/v1/systemone` would.
+Two or more are joined as `role: content` blocks separated by a blank line:
+
+```
+system: You triage tickets.
+
+user: My payouts fail.
+
+assistant: Since when?
+
+user: 3 days.
+```
+
+On `/api/generate`, the state is the `prompt`, verbatim, or `system: ...` and
+`user: ...` blocks when `system` is set. The model was calibrated on plain-text states,
+so put the instructions in each property's `description` rather than in a system message.
+
+### From answers to content
+
+- A boolean is `true` when P(true) is at least 0.5.
+- A choice is the most probable option, returned as the enum value with its JSON type (an
+  integer enum gives an integer).
+- A score is the enum value at the expected level, rounded half up. The score answer stays
+  an expected value over the levels, as on `/v1/systemone`.
+
+The full answers, with probabilities, confidences and the exact expected score, are in a
+top-level `strands_decider` field. It has the same shape as the `answers` of
+`/v1/systemone`, plus `usage` and `latency_ms`. Standard Ollama clients ignore it.
+
+```bash
+curl -s localhost:11434/api/chat -H 'content-type: application/json' -d '{
+  "model": "strands-decider",
+  "stream": false,
+  "messages": [{"role": "user", "content": "Help! My payouts have been failing for 3 days."}],
+  "format": {
+    "type": "object",
+    "properties": {
+      "is_urgent":  {"type": "boolean", "description": "Does this convey urgency?"},
+      "department": {"type": "string", "enum": ["billing", "technical", "sales"],
+                     "description": "Which team should handle this?",
+                     "x-strands-decider": {"criteria": {"billing": "money", "technical": "bugs", "sales": "pricing"}}},
+      "frustration":{"type": "string", "enum": ["calm", "frustrated", "very angry"],
+                     "description": "How frustrated is the writer?",
+                     "x-strands-decider": {"type": "score"}}
+    },
+    "required": ["is_urgent", "department", "frustration"]
+  }
+}'
+```
+
+An illustrative reply follows. It shows the shape, not recorded output: the numbers are
+made up.
+
+```json
+{
+  "model": "hobson-2b-recipe",
+  "created_at": "2025-01-01T12:00:00.123456Z",
+  "message": {"role": "assistant",
+              "content": "{\"is_urgent\": true, \"department\": \"technical\", \"frustration\": \"frustrated\"}"},
+  "done": true,
+  "done_reason": "stop",
+  "total_duration": 152000000,
+  "load_duration": 0,
+  "prompt_eval_count": 120,
+  "prompt_eval_duration": 150000000,
+  "eval_count": 3,
+  "eval_duration": 0,
+  "strands_decider": {
+    "answers": {
+      "is_urgent": {"type": "noul", "noul": 0.80},
+      "department": {"type": "choice", "choice": "technical",
+                     "probabilities": {"billing": 0.23, "technical": 0.75, "sales": 0.02},
+                     "confidence": 0.62},
+      "frustration": {"type": "score", "score": 1.24,
+                      "legend": {"0": "calm", "1": "frustrated", "2": "very angry"},
+                      "probabilities": {"0": 0.09, "1": 0.58, "2": 0.33}, "confidence": 0.58}
+    },
+    "usage": {"input_tokens": 120, "output_tokens": 3},
+    "latency_ms": 150.0
+  }
+}
+```
+
+All durations are integer nanoseconds. `prompt_eval_count` is the input token count and
+`eval_count` is one decision per question. `load_duration` and `eval_duration` are 0: the
+model loads at startup, and no tokens are generated. A client that divides by
+`eval_duration` to report tokens per second has nothing to measure. `/api/generate`
+returns the same keys, with the content in `response` instead of `message`.
+
+### Streaming
+
+`stream` defaults to `true`, as in Ollama. A streamed reply is `application/x-ndjson` with
+exactly one line: the full reply above, which already has `"done": true`. A client that
+joins the content of all chunks gets the full JSON. The answer is computed before the
+stream starts, so an error is still a plain 400 JSON body.
+
+### Errors and ignored fields
+
+Every caller error is HTTP 400 with `{"error": "..."}`, the key Ollama clients read:
+
+- `format` missing, not a schema, or `"json"` alone: the message explains that the decider
+  needs a JSON schema of questions.
+- A property the decider cannot answer, or a malformed `x-strands-decider`: the message
+  names the property.
+- `images`, on a chat message or a generate request: refused, the model is text-only.
+- `tools` on a chat request: refused, the decider does not call tools.
+- A body that is not JSON, a field of the wrong type, or a question the model cannot take,
+  such as more options than its slots or a prompt over the window under `--strict-window`.
+
+`options`, `keep_alive`, `think`, `raw`, `template`, `context`, `suffix`, a message's
+`tool_calls` and `thinking`, and unknown fields are ignored.
+
+### Discovery
+
+`GET /api/tags` lists the one served model. `POST /api/show` describes it, whatever name
+is asked for, with the checkpoint, base model, slot count and window in `model_info`.
+`GET /api/version` returns `{"version": "0.5.0", "strands_decider": "<package version>"}`.
+`version` is the Ollama API level emulated, not the package version: structured outputs
+arrived in Ollama 0.5.0, and a client that checks the version would treat a lower one as
+too old.
+
+The Ollama routes are always on and have the same exposure as `/v1/systemone`: the server
+binds to `127.0.0.1` by default and has no authentication. Use it for local experiments
+only ([Security](../README.md#security)).
 
 ## Asking many questions is nearly free
 
