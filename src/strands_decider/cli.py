@@ -314,7 +314,7 @@ def serve_cmd(
         32, "--max-batch", help="Questions encoded per forward pass; lower it for very long states.",
     ),
 ) -> None:
-    """Serve POST /v1/systemone. JevBench's typesafe adapter runs against it unchanged."""
+    """Serve POST /v1/systemone and an Ollama-compatible /api/chat, /api/generate. JevBench's typesafe adapter runs against /v1/systemone unchanged."""
     from .server import serve
 
     selected_device = device or _auto_device()

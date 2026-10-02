@@ -3,6 +3,7 @@
 The path and the request and response shapes follow the public Jev API documentation.
 JevBench's typesafe adapter runs against this server unchanged (evaluation/jevbench.md).
 Compatibility with the Jev API itself is not verified.
+It also serves an Ollama-compatible `/api/*` surface (ollama_api.py).
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from fastapi.responses import JSONResponse
 
 from .infer import EngineConfig, SystemOneEngine
 from .modeling import StrandsDeciderModel
+from .ollama_api import build_router as build_ollama_router
 from .schema import SystemOneRequest, SystemOneResponse
 
 _engine: SystemOneEngine | None = None
@@ -85,6 +87,8 @@ def create_app(
         payload = response.model_dump()
         payload["latency_ms"] = round(elapsed_ms, 2)
         return JSONResponse(content=payload)
+
+    app.include_router(build_ollama_router(get_engine, checkpoint=checkpoint))
 
     return app
 
