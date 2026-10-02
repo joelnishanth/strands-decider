@@ -528,15 +528,41 @@ def _to_answer(
     )
 
 
-@torch.inference_mode()  # type: ignore[untyped-decorator]
+BACKENDS = ("torch", "mlx")
+
+
+def make_torso_backend(name: str, model: StrandsDeciderModel) -> TorsoBackend | None:
+    """The backend named `name` for a loaded model; None means the engine's TorchBackend.
+
+    For "mlx" the torso is converted to MLX and the torch torso is then dropped
+    (`model.torso` becomes nn.Identity()), which frees its memory: nothing reads it again.
+    """
+    if name == "torch":
+        return None
+    if name == "mlx":
+        from .mlx_backend import MlxBackend
+
+        backend = MlxBackend.from_model(model)
+        model.torso = torch.nn.Identity()
+        return backend
+    raise ValueError(f"unknown backend {name!r}; choose one of {', '.join(BACKENDS)}")
+
+
+@torch.inference_mode()  # type: ignore[untyped-decorator, unused-ignore]
 def load_engine(
     checkpoint: str,
     *,
     device: str = "cuda",
     use_prefix_cache: bool = True,
     attn_implementation: str | None = None,
+    backend: str = "torch",
 ) -> SystemOneEngine:
+    """Load a checkpoint and wrap it in an engine. With backend="mlx" the readout runs on
+    CPU, whatever `device` says, and MLX runs the torso on the GPU."""
+    if backend == "mlx":
+        device = "cpu"
     model = StrandsDeciderModel.load(checkpoint, attn_implementation=attn_implementation)
     return SystemOneEngine(
-        model, EngineConfig(device=device, use_prefix_cache=use_prefix_cache)
+        model, EngineConfig(device=device, use_prefix_cache=use_prefix_cache),
+        backend=make_torso_backend(backend, model),
     )

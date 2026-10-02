@@ -277,6 +277,27 @@ def _auto_device() -> str:
     return "cpu"
 
 
+def _select_device(backend: str, device: str | None) -> str:
+    """The torch device for `backend`. MLX runs the torso itself, so the torch side
+    (the readout) runs on CPU, and an explicit other --device is refused."""
+    from .infer import BACKENDS
+
+    if backend not in BACKENDS:
+        raise typer.BadParameter(
+            f"unknown backend {backend!r}; choose one of {', '.join(BACKENDS)}",
+            param_hint="--backend",
+        )
+    if backend == "mlx":
+        if device is not None and device != "cpu":
+            raise typer.BadParameter(
+                f"--backend mlx runs the torso through MLX and the readout on cpu; "
+                f"drop --device {device}",
+                param_hint="--device",
+            )
+        return "cpu"
+    return device or _auto_device()
+
+
 def _fmt_temperature(t: float | dict[str, float]) -> str:
     """Temperature is a scalar, or a {primitive: value} map once fitted per kind."""
     if isinstance(t, dict):
@@ -313,17 +334,21 @@ def serve_cmd(
     max_batch: int = typer.Option(
         32, "--max-batch", help="Questions encoded per forward pass; lower it for very long states.",
     ),
+    backend: str = typer.Option(
+        "torch", "--backend",
+        help="Torso runtime: torch, or mlx on Apple silicon (pip install 'strands-decider\\[mlx]').",
+    ),
 ) -> None:
     """Serve POST /v1/systemone. JevBench's typesafe adapter runs against it unchanged."""
+    selected_device = _select_device(backend, device)
     from .server import serve
 
-    selected_device = device or _auto_device()
     _configure_inference_logging(selected_device)
     console.print(f"[green]serving[/] {checkpoint} on http://{host}:{port}")
     serve(
         checkpoint, host=host, port=port, device=selected_device,
         use_prefix_cache=not no_prefix_cache, model_name=model_name,
-        strict_window=strict_window, max_batch=max_batch,
+        strict_window=strict_window, max_batch=max_batch, backend=backend,
     )
 
 
@@ -343,9 +368,15 @@ def ask_cmd(
         help="Torch device (cuda|mps|cpu). Auto-detected when omitted.",
     ),
     as_json: bool = typer.Option(False, "--json", help="Print the raw API response."),
+    backend: str = typer.Option(
+        "torch", "--backend",
+        help="Torso runtime: torch, or mlx on Apple silicon (pip install 'strands-decider\\[mlx]').",
+    ),
 ) -> None:
     """Ask one state a set of typed questions from the command line."""
     from .infer import load_engine
+
+    selected_device = _select_device(backend, device)
 
     questions: dict[str, Question] = {}
     for i, q in enumerate(noul or []):
@@ -367,9 +398,8 @@ def ask_cmd(
     if not questions:
         raise typer.BadParameter("ask at least one --noul / --choice / --score question")
 
-    selected_device = device or _auto_device()
     _configure_inference_logging(selected_device)
-    engine = load_engine(checkpoint, device=selected_device)
+    engine = load_engine(checkpoint, device=selected_device, backend=backend)
     response = engine.ask(state, questions)
 
     if as_json:

@@ -40,11 +40,18 @@ class _StubModel:
     config = _StubModelCfg()
 
 
+class _StubBackend:
+    name = "torch"
+
+
 class _StubEngine:
     """Returns a fixed, concentrated distribution: exercises the response path only."""
 
     cfg = _StubCfg()
     model = _StubModel()
+
+    def __init__(self, backend=None):
+        self.backend = backend or _StubBackend()
 
     def evaluate(self, request):
         answers = {}
@@ -98,11 +105,40 @@ def test_health_identifies_checkpoint(monkeypatch):
     still holding the port cannot pass for the one just started."""
     monkeypatch.setattr(server, "_engine", None)
     monkeypatch.setattr(server.StrandsDeciderModel, "load", lambda *a, **k: _StubModel())
-    monkeypatch.setattr(server, "SystemOneEngine", lambda model, cfg: _StubEngine())
+    monkeypatch.setattr(server, "SystemOneEngine", lambda model, cfg, **kw: _StubEngine())
     r = TestClient(server.create_app("checkpoints/strands-decider-test", device="cpu")).get("/health")
     assert r.status_code == 200
     assert r.json()["checkpoint"] == "checkpoints/strands-decider-test"
     assert r.json()["max_length"] == 512
+    assert r.json()["backend"] == "torch"
+
+
+def test_health_reports_the_mlx_backend(monkeypatch):
+    """create_app(backend="mlx") asks make_torso_backend for it, hands the result to the
+    engine with the readout on cpu, and /health names it."""
+    class _Mlx:
+        name = "mlx"
+
+    asked, built = [], []
+
+    def make(name, model):
+        asked.append(name)
+        return _Mlx()
+
+    def engine(model, cfg, backend=None):
+        built.append((cfg.device, backend))
+        return _StubEngine(backend)
+
+    monkeypatch.setattr(server, "_engine", None)
+    monkeypatch.setattr(server.StrandsDeciderModel, "load", lambda *a, **k: _StubModel())
+    monkeypatch.setattr(server, "make_torso_backend", make)
+    monkeypatch.setattr(server, "SystemOneEngine", engine)
+    app = server.create_app("checkpoints/strands-decider-test", device="mps", backend="mlx")
+    r = TestClient(app).get("/health")
+    assert r.status_code == 200
+    assert r.json()["backend"] == "mlx"
+    assert asked == ["mlx"]
+    assert built[0][0] == "cpu" and isinstance(built[0][1], _Mlx)
 
 
 def test_documented_payload_round_trips(client):
@@ -204,8 +240,8 @@ def test_real_create_app_routes_work(monkeypatch):
     from strands_decider import infer
 
     monkeypatch.setattr(server.StrandsDeciderModel, "load", classmethod(lambda cls, *a, **k: _StubModel()))
-    monkeypatch.setattr(server, "SystemOneEngine", lambda model, cfg: _StubEngine())
-    monkeypatch.setattr(infer, "SystemOneEngine", lambda model, cfg=None: _StubEngine())
+    monkeypatch.setattr(server, "SystemOneEngine", lambda model, cfg, **kw: _StubEngine())
+    monkeypatch.setattr(infer, "SystemOneEngine", lambda model, cfg=None, **kw: _StubEngine())
 
     app = server.create_app("checkpoints/does-not-exist", device="cpu")
     client = TestClient(app)
@@ -236,7 +272,7 @@ def test_too_many_options_returns_422(monkeypatch):
             raise ValueError("question has 30 options but this model has 24 slots")
 
     monkeypatch.setattr(server.StrandsDeciderModel, "load", classmethod(lambda cls, *a, **k: _StubModel()))
-    monkeypatch.setattr(server, "SystemOneEngine", lambda model, cfg: _NarrowEngine())
+    monkeypatch.setattr(server, "SystemOneEngine", lambda model, cfg, **kw: _NarrowEngine())
 
     app = server.create_app("checkpoints/does-not-exist", device="cpu")
     r = TestClient(app).post(

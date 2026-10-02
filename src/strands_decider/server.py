@@ -13,7 +13,7 @@ import time
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
-from .infer import EngineConfig, SystemOneEngine
+from .infer import EngineConfig, SystemOneEngine, make_torso_backend
 from .modeling import StrandsDeciderModel
 from .schema import SystemOneRequest, SystemOneResponse
 
@@ -35,6 +35,7 @@ def create_app(
     attn_implementation: str | None = None,
     strict_window: bool = False,
     max_batch: int = 32,
+    backend: str = "torch",
 ) -> FastAPI:
     global _engine
 
@@ -48,6 +49,8 @@ def create_app(
     # on the same host cannot be confused. HF repo ids ("org/name") collapse to `name`.
     resolved_name = model_name or os.path.basename(checkpoint.rstrip("/")) or checkpoint
 
+    if backend == "mlx":
+        device = "cpu"  # the readout; MLX runs the torso on the GPU
     model = StrandsDeciderModel.load(checkpoint, attn_implementation=attn_implementation)
     _engine = SystemOneEngine(
         model,
@@ -55,6 +58,7 @@ def create_app(
             device=device, use_prefix_cache=use_prefix_cache, model_name=resolved_name,
             strict_window=strict_window, max_batch=max_batch,
         ),
+        backend=make_torso_backend(backend, model),
     )
 
     @app.get("/health")
@@ -69,6 +73,7 @@ def create_app(
             "max_length": eng.model.config.max_length,
             "temperature": eng.model.config.temperature,
             "device": eng.cfg.device,
+            "backend": eng.backend.name,
             "prefix_cache": eng.cfg.use_prefix_cache,
         }
 
@@ -99,6 +104,7 @@ def serve(
     model_name: str | None = None,
     strict_window: bool = False,
     max_batch: int = 32,
+    backend: str = "torch",
 ) -> None:
     import uvicorn
 
@@ -109,6 +115,7 @@ def serve(
         model_name=model_name,
         strict_window=strict_window,
         max_batch=max_batch,
+        backend=backend,
     )
     # Single worker: the model owns the GPU, and forking more would just duplicate it.
     uvicorn.run(app, host=host, port=port, workers=1)

@@ -29,6 +29,12 @@ dependencies = [
 [project.optional-dependencies]
 # Only the corpus build uses datasets: `strands-decider data build` and `python -m strands_decider.data.multistep`.
 train = ["datasets>=2.20"]
+# `--backend mlx`: the torso on Apple silicon through MLX. Exact pins, because the backend
+# builds mlx_lm's Qwen3.5 TextModel and cache classes directly. A no-op elsewhere.
+mlx = [
+    "mlx==0.32.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx-lm==0.31.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",
