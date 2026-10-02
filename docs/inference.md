@@ -15,6 +15,8 @@ checkpoint with `strands-decider calibrate` before you serve it.
 - [Serve](#serve): `POST /v1/systemone` and `/health`, on `127.0.0.1` with no authentication.
 - [Asking many questions is nearly free](#asking-many-questions-is-nearly-free): the shared-prefix cache.
 - [Serving on a Mac](#serving-on-a-mac): MPS, and the one kernel that had to be replaced.
+- [MLX backend on Apple silicon](#mlx-backend-on-apple-silicon): `--backend mlx`, the torso
+  through MLX instead of PyTorch.
 - [`../examples/strands/`](../examples/strands/README.md): an agent built with the Strands
   Agents SDK that uses the server, with its client in `_client.py`.
 - [`../evaluation/results.md`](../evaluation/results.md): measured latency and accuracy on an
@@ -156,7 +158,8 @@ strands-decider serve checkpoints/hobson-2b-recipe --port 8000
 targets this endpoint and runs against it unmodified: 231 of 231 tasks attempted and
 schema validity 1.000 ([External benchmark](../evaluation/jevbench.md#external-benchmark-jevbench-v1-public-set)).
 Compatibility with the Jev API itself is not verified. `GET /health` returns the model
-name, the checkpoint path, the base model, the device and the calibration temperature.
+name, the checkpoint path, the base model, the device, the torso `backend` (`torch` or
+`mlx`) and the calibration temperature.
 
 The server binds to `127.0.0.1` by default and has no authentication. Its behaviour under
 concurrent requests is not verified. Use it for local experiments only
@@ -247,3 +250,32 @@ random-input tests and was wrong by up to 5e8 on real activations. Correlated,
 l2-normalised keys make the powers of N huge before they cancel.
 `tests/test_mps_kernels.py` builds its inputs that way and fails 14 cases against that
 version.
+
+## MLX backend on Apple silicon
+
+`--backend mlx` runs the torso through [MLX](https://github.com/ml-explore/mlx) on the Mac's
+GPU instead of through PyTorch. Everything after the torso is unchanged: the pointer head,
+the temperature and the softmax run in PyTorch on the CPU, so the response has the same
+shape and the same calibration. The default stays `--backend torch`.
+
+```bash
+pip install -e ".[mlx]"   # mlx and mlx-lm, pinned; a no-op off Apple silicon
+strands-decider ask checkpoints/hobson-2b-recipe --backend mlx -s "Help! My payouts have been failing." \
+  --noul "Does this convey urgency?"
+strands-decider serve checkpoints/hobson-2b-recipe --backend mlx --port 8099
+```
+
+Pass no `--device` with `--backend mlx`: MLX picks the GPU for the torso, and the readout
+runs on `cpu`. Any other `--device` is refused before the checkpoint loads. `GET /health`
+reports `"backend": "mlx"` and `"device": "cpu"`.
+
+The checkpoint loads exactly as it does for PyTorch, then the torso is converted. The LoRA
+adapter is merged into the base weights at load time, and the merged weights are kept in
+the checkpoint's dtype (bf16 for v19). The PyTorch copy of the torso is then released. Only
+Qwen3.5 text torsos are supported (v19's is one); any other torso, such as v7's Qwen3, is
+refused with an error. The shared-prefix cache works the same way, and `--no-prefix-cache` still
+switches to batched encoding.
+
+`tests/test_mlx_backend.py` checks the MLX hidden states and the end-to-end answers against
+the PyTorch backend on a tiny hybrid checkpoint with a LoRA adapter, with and without the
+prefix cache. It is skipped off Apple silicon or without the `mlx` extra.

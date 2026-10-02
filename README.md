@@ -163,8 +163,9 @@ curl -s localhost:8000/v1/systemone \
 ## About the model
 
 `strands-decider-2B`, the first model of the family, has 1.9 billion parameters. It answers a
-question in a median 115 ms on an RTX 3090 and also serves on an Apple-silicon Mac or on CPU,
-and many questions about one text are cheap, because the text is read once and each question
+question in a median 115 ms on an RTX 3090 and also serves on an Apple-silicon Mac (with
+PyTorch, or with MLX: [`--backend mlx`](docs/inference.md#mlx-backend-on-apple-silicon)) or
+on CPU, and many questions about one text are cheap, because the text is read once and each question
 adds only its own tokens
 ([docs/inference.md](docs/inference.md#asking-many-questions-is-nearly-free)). Its
 accuracy and calibration are measured on JevBench, a third-party benchmark for this class of
